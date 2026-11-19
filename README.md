@@ -13,10 +13,11 @@ cd ~/video-correction
 .venv/bin/pip install opencv-python-headless numpy
 ```
 
-## Run
+## Run (returns Terminal to you immediately)
 ```bash
-.venv/bin/python app.py
+open ~/Desktop/"Band Stabilizer.app"
 ```
+Before the launcher exists: `(.venv/bin/python app.py >/dev/null 2>&1 &)`
 Double-click launcher: `./make_app.sh` creates `Band Stabilizer.app` on the Desktop
 (re-run it if you move this folder).
 
