@@ -165,10 +165,19 @@ class Decoder:
 
 # ---------------------------------------------------------------- similarity math
 
+REGION_TIME = 3.0  # seconds into the video where the reference area is chosen
+
+
+def region_time(duration):
+    return min(REGION_TIME, duration / 2)
+
+
 def first_frame_png(src, out_png, max_w=960, max_h=600):
-    """Write the first frame (orientation applied) for the reference-area picker."""
-    ffmpeg, _ = check_dependencies()
-    r = subprocess.run([ffmpeg, "-v", "error", "-y", "-nostdin", "-i", src, "-frames:v", "1",
+    """Write the frame at REGION_TIME (orientation applied) for the reference-area picker."""
+    ffmpeg, ffprobe = check_dependencies()
+    t = region_time(probe(ffprobe, src)["duration"])
+    r = subprocess.run([ffmpeg, "-v", "error", "-y", "-nostdin", "-ss", f"{t:.3f}", "-i", src,
+                        "-frames:v", "1",
                         "-vf", f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease",
                         out_png], capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out_png):
@@ -287,11 +296,13 @@ def analyze(ffmpeg, src, info, aw, ah, K, region, progress, cancel):
     Kinv = np.linalg.inv(K)
     thresh = 0.5 * (0.7 / K[0, 0]) ** 2  # ~0.7 px angular tolerance
     rng = np.random.default_rng(0)
-    box = None
+    box = box_sel = None
+    pick = int(round(region_time(info["duration"]) * info["fps"]))
     if region is not None:
         x0, y0, x1, y1 = region
-        box = np.array([[x0 * aw, y0 * ah], [x1 * aw, y0 * ah],
-                        [x1 * aw, y1 * ah], [x0 * aw, y1 * ah]])
+        box_sel = np.array([[x0 * aw, y0 * ah], [x1 * aw, y0 * ah],
+                            [x1 * aw, y1 * ah], [x0 * aw, y1 * ah]])
+        box = box_sel.copy()  # before the pick frame the shake is small: use it as drawn
         area0 = (x1 - x0) * aw * (y1 - y0) * ah
     total = max(1, int(round(info["duration"] * info["fps"])))
     path, acc, prev, misses = [], np.eye(3), None, 0
@@ -316,7 +327,9 @@ def analyze(ffmpeg, src, info, aw, ah, K, region, progress, cancel):
                 if R is None:
                     R, misses = np.eye(3), misses + 1
                 acc = R @ acc
-                if box is not None:
+                if box_sel is not None and len(path) == pick:
+                    box = box_sel.copy()  # exact selection at the frame it was drawn on
+                elif box is not None and len(path) > pick:
                     hb = np.hstack([box, np.ones((4, 1))]) @ (K @ R @ Kinv).T
                     box = hb[:, :2] / hb[:, 2:]
             path.append(R2rv(acc))
@@ -471,7 +484,7 @@ def output_path(src):
     return os.path.splitext(src)[0] + "_stabilized.mp4"
 
 
-MOTION_VERSION = 2
+MOTION_VERSION = 3
 
 
 def motion_path(src):

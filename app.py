@@ -110,7 +110,7 @@ class App:
             messagebox.showerror("Can't show frame", str(e))
             return
         top = tk.Toplevel(self.root)
-        top.title("Drag a box over the bleachers / stands (not the band)")
+        top.title("Frame at 3 s — drag a box over the bleachers / stands (not the band)")
         top.transient(self.root)
         iw, ih = img.width(), img.height()
         cv = tk.Canvas(top, width=iw, height=ih, highlightthickness=0, cursor="crosshair")
