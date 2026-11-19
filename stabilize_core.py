@@ -24,7 +24,6 @@ STRENGTHS = {
 }
 ANALYSIS_WIDTH = 640
 COPYABLE_AUDIO = {"aac"}
-DECODABLE_AUDIO_HINT = {"apac"}  # Apple spatial audio: ffmpeg can't read it
 
 
 class StabilizeError(Exception):
@@ -112,6 +111,13 @@ def pick_encoder(ffmpeg):
         if r.returncode == 0:
             return enc
     raise StabilizeError("ffmpeg has no usable H.264 encoder. Reinstall with: brew reinstall ffmpeg")
+
+
+def audio_decodable(ffmpeg, src, index):
+    """True if ffmpeg can decode this audio track (iPhone spatial audio/APAC can't be)."""
+    r = subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", src, "-map", f"0:{index}",
+                        "-t", "1", "-f", "null", "-"], capture_output=True)
+    return r.returncode == 0
 
 
 # ---------------------------------------------------------------- decoding
@@ -307,8 +313,7 @@ def plan(path, fps, aw, ah, zoom, sigma_s):
 def render(ffmpeg, src, tmp_out, info, W, H, mats, scale, encoder, progress, cancel):
     crop = f"crop={W}:{H}:0:0" if (W, H) != (info["w"], info["h"]) else None
     dec = Decoder(ffmpeg, src, info["fps_str"], W, H, "bgr24", vf=crop)
-    usable = [a for a in info["audio"] if a.get("codec_name") not in (None, "none", "unknown")
-              and a.get("codec_name") not in DECODABLE_AUDIO_HINT]
+    usable = [a for a in info["audio"] if audio_decodable(ffmpeg, src, a["index"])]
     cmd = [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{W}x{H}", "-framerate", info["fps_str"]]
     if info["video_offset"] > 0.001:
