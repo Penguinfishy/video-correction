@@ -378,6 +378,43 @@ def output_path(src):
     return os.path.splitext(src)[0] + "_stabilized.mp4"
 
 
+# ---------------------------------------------------------------- motion cache
+MOTION_VERSION = 1
+
+
+def motion_path(src):
+    """Saved camera-motion analysis, next to the original (e.g. IMG_4569_motion.npz)."""
+    return os.path.splitext(src)[0] + "_motion.npz"
+
+
+def _src_id(src):
+    st = os.stat(src)
+    return np.array([st.st_size, int(st.st_mtime)], np.int64)
+
+
+def load_motion(src, info, aw, ah):
+    """Return the saved camera path if it matches this exact file and settings, else None."""
+    try:
+        d = np.load(motion_path(src))
+        if (int(d["version"]) == MOTION_VERSION and np.array_equal(d["src_id"], _src_id(src))
+                and int(d["aw"]) == aw and int(d["ah"]) == ah
+                and str(d["fps_str"]) == info["fps_str"]):
+            return d["path"]
+    except Exception:
+        pass
+    return None
+
+
+def save_motion(src, info, aw, ah, path):
+    """Saves per-frame camera path: columns = angle (rad), log scale, x, y (analysis px,
+    centered coords, frame 0 -> frame t). Any strength can be re-planned from this."""
+    try:
+        np.savez(motion_path(src), version=MOTION_VERSION, src_id=_src_id(src), aw=aw, ah=ah,
+                 fps_str=info["fps_str"], fps=info["fps"], path=path)
+    except OSError:
+        pass  # read-only folder: just analyze again next time
+
+
 def check_dependencies():
     ff, fp = find_tool("ffmpeg"), find_tool("ffprobe")
     if not ff or not fp:
@@ -398,7 +435,12 @@ def stabilize(src, dst, strength="Gentle", progress=lambda f, m: None, cancel=No
 
     progress(0.0, "Checking encoder…")
     encoder = pick_encoder(ffmpeg)
-    path = analyze(ffmpeg, src, info, aw, ah, progress, cancel)
+    path = load_motion(src, info, aw, ah)
+    if path is None:
+        path = analyze(ffmpeg, src, info, aw, ah, progress, cancel)
+        save_motion(src, info, aw, ah, path)
+    else:
+        progress(0.4, "Using saved motion analysis…")
     progress(0.4, "Planning smooth camera path…")
     mats, limited = plan(path, info["fps"], aw, ah, cfg["zoom"], cfg["sigma"])
 

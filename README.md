@@ -22,3 +22,6 @@ Double-click launcher: `./make_app.sh` creates `Band Stabilizer.app` on the Desk
 
 Output: `yourvideo_stabilized.mp4` next to the original (H.264 + original audio).
 Command line alternative: `.venv/bin/python stabilize_core.py video.mov Gentle`
+
+Motion analysis is saved as `yourvideo_motion.npz` next to the original. Re-running
+with a different strength reuses it and only re-renders. Delete it to force a fresh analysis.
