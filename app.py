@@ -1,6 +1,7 @@
 """Band Stabilizer: small macOS window around stabilize_core."""
 import os
 import queue
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,7 +18,7 @@ VIDEO_TYPES = [("Videos", "*.mov *.MOV *.mp4 *.MP4 *.m4v *.M4V *.avi *.mkv *.mts
 
 class App:
     def __init__(self, root):
-        self.root, self.src, self.worker = root, None, None
+        self.root, self.src, self.worker, self.region = root, None, None, None
         self.cancel, self.q = threading.Event(), queue.Queue()
         root.title("Band Stabilizer")
         root.resizable(False, False)
@@ -37,10 +38,16 @@ class App:
         self.go = ttk.Button(f, text="Stabilize", command=self.start, state="disabled")
         self.go.grid(row=1, column=2, sticky="e")
 
+        self.ref_btn = ttk.Button(f, text="Set Bleachers Area…", command=self.pick_region,
+                                  state="disabled")
+        self.ref_btn.grid(row=2, column=0, sticky="w", pady=(0, 10))
+        self.ref_lbl = ttk.Label(f, text="Reference: whole frame")
+        self.ref_lbl.grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(0, 10))
+
         self.bar = ttk.Progressbar(f, maximum=1.0, length=440)
-        self.bar.grid(row=2, column=0, columnspan=3, sticky="ew")
+        self.bar.grid(row=3, column=0, columnspan=3, sticky="ew")
         self.status = ttk.Label(f, text="Choose a video to begin.", wraplength=440)
-        self.status.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         menubar = tk.Menu(root)
         fm = tk.Menu(menubar, tearoff=0)
@@ -80,9 +87,75 @@ class App:
             self.src = p
             self.file_lbl.config(text=os.path.basename(p))
             self.go.config(state="normal" if core else "disabled")
+            self.ref_btn.config(state="normal" if core else "disabled")
             self.bar["value"] = 0
-            self.status.config(text="Ready. Output: " + os.path.basename(core.output_path(p))
-                               if core else "Dependencies missing.")
+            self.set_region(core.saved_region(p) if core else None)
+            self.status.config(text="Tip: click Set Bleachers Area and drag a box over the "
+                               "stands/buildings, then Stabilize." if core else
+                               "Dependencies missing.")
+
+    def set_region(self, region):
+        self.region = region
+        self.ref_lbl.config(text="Reference: whole frame" if region is None else
+                            "Reference: selected bleachers area ✓")
+
+    def pick_region(self):
+        if self.busy() or not self.src:
+            return
+        png = os.path.join(tempfile.gettempdir(), "band_stabilizer_frame.png")
+        try:
+            core.first_frame_png(self.src, png)
+            img = tk.PhotoImage(file=png)
+        except Exception as e:
+            messagebox.showerror("Can't show frame", str(e))
+            return
+        top = tk.Toplevel(self.root)
+        top.title("Drag a box over the bleachers / stands (not the band)")
+        top.transient(self.root)
+        iw, ih = img.width(), img.height()
+        cv = tk.Canvas(top, width=iw, height=ih, highlightthickness=0, cursor="crosshair")
+        cv.pack()
+        cv.create_image(0, 0, image=img, anchor="nw")
+        cv.image = img
+        st = {"rect": None, "x0": 0, "y0": 0, "box": None}
+        if self.region:
+            x0, y0, x1, y1 = self.region
+            st["box"] = (x0 * iw, y0 * ih, x1 * iw, y1 * ih)
+            st["rect"] = cv.create_rectangle(*st["box"], outline="#ffd60a", width=3)
+
+        def down(e):
+            st["x0"], st["y0"] = e.x, e.y
+            if st["rect"]:
+                cv.delete(st["rect"])
+            st["rect"] = cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#ffd60a", width=3)
+
+        def drag(e):
+            x, y = min(max(e.x, 0), iw), min(max(e.y, 0), ih)
+            cv.coords(st["rect"], st["x0"], st["y0"], x, y)
+            st["box"] = (min(st["x0"], x), min(st["y0"], y), max(st["x0"], x), max(st["y0"], y))
+
+        def use():
+            b = st["box"]
+            if not b or (b[2] - b[0]) < 0.1 * iw or (b[3] - b[1]) < 0.05 * ih:
+                messagebox.showinfo("Area too small", "Drag a larger box over the bleachers.",
+                                    parent=top)
+                return
+            self.set_region((b[0] / iw, b[1] / ih, b[2] / iw, b[3] / ih))
+            top.destroy()
+
+        def whole():
+            self.set_region(None)
+            top.destroy()
+
+        cv.bind("<ButtonPress-1>", down)
+        cv.bind("<B1-Motion>", drag)
+        bar = ttk.Frame(top, padding=8)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Include lots of still detail: stands, railings, buildings, "
+                  "goal posts.").pack(side="left")
+        ttk.Button(bar, text="Use This Area", command=use).pack(side="right")
+        ttk.Button(bar, text="Whole Frame", command=whole).pack(side="right", padx=6)
+        top.grab_set()
 
     def start(self):
         if self.busy() or not self.src or not core:
@@ -92,16 +165,16 @@ class App:
                 "File exists", f"{os.path.basename(dst)} already exists.\n\nReplace it?"):
             return
         self.cancel.clear()
-        for w in (self.go, self.combo):
+        for w in (self.go, self.combo, self.ref_btn):
             w.config(state="disabled")
-        args = (self.src, dst, self.strength.get())
+        args = (self.src, dst, self.strength.get(), self.region)
         self.worker = threading.Thread(target=self.run, args=args, daemon=True)
         self.worker.start()
 
-    def run(self, src, dst, strength):
+    def run(self, src, dst, strength, region):
         try:
             core.stabilize(src, dst, strength,
-                           lambda f, m: self.q.put(("progress", f, m)), self.cancel)
+                           lambda f, m: self.q.put(("progress", f, m)), self.cancel, region)
             self.q.put(("done", None, None))
         except core.Cancelled:
             self.q.put(("cancelled", None, None))
@@ -119,6 +192,7 @@ class App:
                     self.status.config(text=msg)
                 else:
                     self.go.config(state="normal")
+                    self.ref_btn.config(state="normal")
                     self.combo.config(state="readonly")
                     if kind == "error":
                         self.status.config(text="Failed — original file untouched.")

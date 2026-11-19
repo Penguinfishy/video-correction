@@ -1,9 +1,12 @@
 # Band Stabilizer (macOS, Apple Silicon)
 
-Local, gentle video stabilization for steady wide shots. ffmpeg decodes/encodes;
-OpenCV tracks stationary background points (RANSAC rejects moving performers),
-corrects only rotation + small shifts with one fixed slight zoom, holds a steady
-average framing during held shots, and follows deliberate pans/zooms.
+Local, gentle video stabilization for steady wide shots. It measures how the phone
+rotated (yaw, pitch, roll) from the bleachers/stands you select, then re-renders each
+frame as if the phone had been held at a smoothed orientation (lens-correct 3D
+reprojection, one fixed slight zoom). Held shots lock to one average orientation;
+deliberate pans are kept. Moving performers are rejected as outliers.
+
+In the app: Choose Video → Set Bleachers Area (drag a box over the stands) → Stabilize.
 
 ## Setup (once)
 ```bash

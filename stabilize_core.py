@@ -1,10 +1,15 @@
-"""Stabilization engine: ffmpeg decodes/encodes, OpenCV estimates camera motion.
+"""Stabilization engine: ffmpeg decodes/encodes, OpenCV + numpy estimate camera rotation.
 
-Pass 1: decode small grayscale frames, track background corners with optical
-        flow, fit a rotation+translation(+uniform scale) model per frame pair
-        with RANSAC (moving performers fall out as outliers).
-Pass 2: decode full-resolution frames, apply one smooth correction per frame
-        with a fixed slight zoom, encode, and mux the untouched source audio.
+Model: a handheld phone shooting a distant scene mostly ROTATES (yaw, pitch, roll).
+A pure camera rotation R moves image points by the homography  K R K^-1  (K = lens).
+
+Pass 1: decode small grayscale frames, track corners inside the reference area
+        (the bleachers/stands, which you select) with optical flow, turn them into
+        3D viewing rays, and solve for the 3D rotation between frames with RANSAC
+        (moving people fall out as outliers). The per-frame yaw/pitch/roll path is saved.
+Pass 2: smooth that 3D rotation path, then re-render each full-resolution frame as if
+        the phone had been held at the smoothed orientation: K * R_smooth * R_actual^T * K^-1.
+        A fixed slight zoom hides the edges.
 """
 import json
 import math
@@ -18,11 +23,12 @@ import numpy as np
 
 # zoom = fixed crop for the whole video; sigma = seconds of smoothing during camera moves
 STRENGTHS = {
-    "Gentle": dict(zoom=1.04, sigma=1.0),
-    "Medium": dict(zoom=1.06, sigma=1.6),
-    "Strong": dict(zoom=1.08, sigma=2.5),
+    "Gentle": dict(zoom=1.05, sigma=1.0),
+    "Medium": dict(zoom=1.07, sigma=1.6),
+    "Strong": dict(zoom=1.10, sigma=2.5),
 }
-ANALYSIS_WIDTH = 640
+ANALYSIS_WIDTH = 800
+DEFAULT_F35 = 28.0  # iPhone main camera in video mode, 35mm-equivalent (used if no metadata)
 COPYABLE_AUDIO = {"aac"}
 
 
@@ -32,6 +38,7 @@ class StabilizeError(Exception):
 
 class Cancelled(Exception):
     pass
+
 
 
 # ---------------------------------------------------------------- tools/probe
@@ -98,7 +105,14 @@ def probe(ffprobe, path):
 
     starts = [start(v)] + [start(a) for a in auds]
     bitrate = int(v.get("bit_rate") or 0) or int(fmt.get("bit_rate") or 0)
-    return dict(w=w, h=h, fps_str=f"{fr[0]}/{fr[1]}", fps=fr[0] / fr[1], duration=dur,
+    f35 = None  # iPhones store the 35mm-equivalent focal length in metadata
+    for k, val in list(fmt.get("tags", {}).items()) + list(v.get("tags", {}).items()):
+        if "focal_length" in k.lower() and "35" in k:
+            try:
+                f35 = float(str(val).split()[0])
+            except ValueError:
+                pass
+    return dict(f35=f35 if f35 and 8 <= f35 <= 300 else None, w=w, h=h, fps_str=f"{fr[0]}/{fr[1]}", fps=fr[0] / fr[1], duration=dur,
                 audio=auds, video_offset=max(0.0, start(v) - min(starts)), bitrate=bitrate)
 
 
@@ -150,16 +164,62 @@ class Decoder:
 
 
 # ---------------------------------------------------------------- similarity math
-def to_params(m):
-    return np.array([math.atan2(m[1, 0], m[0, 0]), math.log(math.hypot(m[0, 0], m[1, 0])),
-                     m[0, 2], m[1, 2]])
+
+def first_frame_png(src, out_png, max_w=960, max_h=600):
+    """Write the first frame (orientation applied) for the reference-area picker."""
+    ffmpeg, _ = check_dependencies()
+    r = subprocess.run([ffmpeg, "-v", "error", "-y", "-nostdin", "-i", src, "-frames:v", "1",
+                        "-vf", f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease",
+                        out_png], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out_png):
+        raise StabilizeError("Couldn't read a frame from this video.\n\n" + r.stderr[-800:])
 
 
-def to_mat(p):
-    a, ls, tx, ty = p
-    s = math.exp(ls)
-    c, sn = s * math.cos(a), s * math.sin(a)
-    return np.array([[c, -sn, tx], [sn, c, ty], [0.0, 0.0, 1.0]])
+# ---------------------------------------------------------------- 3D rotation math
+def camera_matrix(w, h, f35):
+    f = (f35 or DEFAULT_F35) * math.hypot(w, h) / 43.27  # 35mm-equivalent -> pixels
+    return np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1.0]])
+
+
+def kabsch(A, B):
+    """Rotation(s) R minimizing |R a - b| for ray sets A, B of shape (..., N, 3)."""
+    M = np.swapaxes(A, -1, -2) @ B
+    U, _, Vt = np.linalg.svd(M)
+    V, Ut = np.swapaxes(Vt, -1, -2).copy(), np.swapaxes(U, -1, -2)
+    d = np.sign(np.linalg.det(V @ Ut))
+    V[..., :, 2] *= d[..., None]
+    return V @ Ut
+
+
+def rays(pts, Kinv):
+    h = np.hstack([pts, np.ones((len(pts), 1))]) @ Kinv.T
+    return h / np.linalg.norm(h, axis=1, keepdims=True)
+
+
+def rv2R(v):
+    return cv2.Rodrigues(np.asarray(v, float).reshape(3, 1))[0]
+
+
+def R2rv(R):
+    return cv2.Rodrigues(np.asarray(R, float))[0].ravel()
+
+
+def rv2q(v):
+    a = float(np.linalg.norm(v))
+    if a < 1e-12:
+        return np.array([1.0, 0, 0, 0])
+    return np.concatenate([[math.cos(a / 2)], math.sin(a / 2) * np.asarray(v) / a])
+
+
+def q2R(q):
+    w, x, y, z = q / np.linalg.norm(q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def qnorm(Q):
+    return Q / np.linalg.norm(Q, axis=-1, keepdims=True)
 
 
 def gsmooth(x, sigma):
@@ -186,41 +246,55 @@ def runs(mask):
 
 
 # ---------------------------------------------------------------- pass 1
-def estimate_motion(prev, cur, center):
-    """Similarity transform (centered coords) mapping prev -> cur, from background points."""
-    eye = np.eye(3)
-    pts = cv2.goodFeaturesToTrack(prev, maxCorners=600, qualityLevel=0.01,
-                                  minDistance=10, blockSize=7)
+
+
+# ---------------------------------------------------------------- pass 1
+def estimate_rotation(prev, cur, Kinv, thresh, mask, rng):
+    """3D camera rotation R (rays_cur = R @ rays_prev) from tracked points, or None."""
+    pts = cv2.goodFeaturesToTrack(prev, maxCorners=600, qualityLevel=0.005,
+                                  minDistance=8, blockSize=7, mask=mask)
     if pts is None or len(pts) < 15:
-        return eye
+        return None
     lk = dict(winSize=(21, 21), maxLevel=3,
               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
     nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, pts, None, **lk)
     back, st2, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, **lk)
     fb = np.linalg.norm((pts - back).reshape(-1, 2), axis=1)
-    ok = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 0.7)
+    ok = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 0.5)
     if ok.sum() < 15:
-        return eye
-    p0 = pts[ok].reshape(-1, 2) - center
-    p1 = nxt[ok].reshape(-1, 2) - center
-    # RANSAC: the largest consistent group (stands, buildings, field markings) wins;
-    # marching performers move inconsistently and are rejected as outliers.
-    m, inl = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC, ransacReprojThreshold=0.6,
-                                         maxIters=3000, confidence=0.995, refineIters=20)
-    if m is None or inl is None or inl.sum() < 12:
-        return eye
-    m3 = np.vstack([m, [0, 0, 1]])
-    a, ls, _, _ = to_params(m3)
-    if abs(a) > math.radians(5) or abs(ls) > 0.1:
-        return eye
-    return m3
+        return None
+    a = rays(pts[ok].reshape(-1, 2).astype(float), Kinv)
+    b = rays(nxt[ok].reshape(-1, 2).astype(float), Kinv)
+    # RANSAC over 2-point rotation hypotheses (all solved at once)
+    idx = rng.integers(0, len(a), (160, 2))
+    idx = idx[idx[:, 0] != idx[:, 1]]
+    Rs = kabsch(a[idx], b[idx])
+    err = 1.0 - np.einsum("kij,nj,ni->kn", Rs, a, b)
+    inl = err[np.argmax((err < thresh).sum(1))] < thresh
+    for _ in range(2):
+        if inl.sum() < 12:
+            return None
+        R = kabsch(a[inl], b[inl])
+        inl = (1.0 - np.sum((a @ R.T) * b, axis=1)) < thresh
+    if inl.sum() < 12 or np.linalg.norm(R2rv(R)) > math.radians(5):
+        return None
+    return R
 
 
-def analyze(ffmpeg, src, info, aw, ah, progress, cancel):
+def analyze(ffmpeg, src, info, aw, ah, K, region, progress, cancel):
+    """Per-frame camera orientation (rotation vectors, frame 0 -> frame t)."""
     dec = Decoder(ffmpeg, src, info["fps_str"], aw, ah, "gray", vf=f"scale={aw}:{ah}:flags=area")
-    center = np.array([aw / 2.0, ah / 2.0], np.float32)
+    Kinv = np.linalg.inv(K)
+    thresh = 0.5 * (0.7 / K[0, 0]) ** 2  # ~0.7 px angular tolerance
+    rng = np.random.default_rng(0)
+    box = None
+    if region is not None:
+        x0, y0, x1, y1 = region
+        box = np.array([[x0 * aw, y0 * ah], [x1 * aw, y0 * ah],
+                        [x1 * aw, y1 * ah], [x0 * aw, y1 * ah]])
+        area0 = (x1 - x0) * aw * (y1 - y0) * ah
     total = max(1, int(round(info["duration"] * info["fps"])))
-    path, acc, prev = [], np.eye(3), None
+    path, acc, prev, misses = [], np.eye(3), None, 0
     try:
         while True:
             if cancel.is_set():
@@ -229,87 +303,106 @@ def analyze(ffmpeg, src, info, aw, ah, progress, cancel):
             if g is None:
                 break
             if prev is not None:
-                acc = estimate_motion(prev, g, center) @ acc  # frame0 -> frame t
-            path.append(to_params(acc))
+                mask = None
+                if box is not None:  # reference area follows the scene as the camera moves
+                    lo = np.clip(box.min(0), 0, [aw, ah]).astype(int)
+                    hi = np.clip(box.max(0), 0, [aw, ah]).astype(int)
+                    if (hi - lo).prod() >= 0.25 * area0:
+                        mask = np.zeros((ah, aw), np.uint8)
+                        mask[lo[1]:hi[1], lo[0]:hi[0]] = 255
+                R = estimate_rotation(prev, g, Kinv, thresh, mask, rng)
+                if R is None and mask is not None:
+                    R = estimate_rotation(prev, g, Kinv, thresh, None, rng)
+                if R is None:
+                    R, misses = np.eye(3), misses + 1
+                acc = R @ acc
+                if box is not None:
+                    hb = np.hstack([box, np.ones((4, 1))]) @ (K @ R @ Kinv).T
+                    box = hb[:, :2] / hb[:, 2:]
+            path.append(R2rv(acc))
             prev = g
             if len(path) % 15 == 0:
                 progress(0.4 * min(1.0, len(path) / total),
-                         f"Analyzing motion… frame {len(path)} of ~{total}")
+                         f"Measuring camera yaw/pitch/roll… frame {len(path)} of ~{total}")
     finally:
         err = dec.close()
     if len(path) < 2:
         raise StabilizeError("Couldn't decode video frames.\n\n" + err)
-    p = np.array(path)
-    p[:, 0] = np.unwrap(p[:, 0])
-    return p
+    return np.array(path)
 
 
 # ---------------------------------------------------------------- planning
-def plan(path, fps, aw, ah, zoom, sigma_s):
-    """Return per-frame 3x3 correction matrices in centered analysis coordinates."""
-    n = len(path)
-    Z = np.diag([zoom, zoom, 1.0])
-    hw, hh = aw / 2.0, ah / 2.0
-    corners = np.array([[-hw, -hh, 1], [hw, -hh, 1], [hw, hh, 1], [-hw, hh, 1]], float).T
-    lim = np.array([[hw * 0.999], [hh * 0.999]])
-    A_inv = [np.linalg.inv(to_mat(p)) for p in path]
+def plan(rotvecs, fps, K, aw, ah, zoom, sigma_s):
+    """Per-frame 3x3 homographies (analysis pixels): source frame -> stabilized frame."""
+    n = len(rotvecs)
+    Kinv = np.linalg.inv(K)
+    cx, cy = aw / 2.0, ah / 2.0
+    Z = np.array([[zoom, 0, cx - zoom * cx], [0, zoom, cy - zoom * cy], [0, 0, 1.0]])
+    corners = np.array([[0, 0, 1], [aw, 0, 1], [aw, ah, 1], [0, ah, 1]], float).T
+    Q = np.array([rv2q(v) for v in rotvecs])
+    for i in range(1, n):  # keep quaternion signs continuous so averaging is valid
+        if Q[i] @ Q[i - 1] < 0:
+            Q[i] = -Q[i]
+    Rt = [q2R(q) for q in Q]
 
-    def corr_params(target, i):
-        return to_params(to_mat(target) @ A_inv[i])
+    def corr(qt, i):  # rotation taking the actual camera to the target camera
+        return R2rv(q2R(qt) @ Rt[i].T)
 
-    def fits(wp):
-        src = np.linalg.inv(Z @ to_mat(wp)) @ corners
-        return bool(np.all(np.abs(src[:2]) <= lim))
+    def fits(c):
+        s = np.linalg.inv(Z @ K @ rv2R(c) @ Kinv) @ corners
+        s = s[:2] / s[2]
+        return bool(np.all((s[0] >= 0) & (s[0] <= aw) & (s[1] >= 0) & (s[1] <= ah)))
 
-    # 1) classify intentional camera moves (pan/zoom/reframe) vs. held shots
-    vel = np.gradient(gsmooth(path, 0.5 * fps), axis=0) * fps
-    moving = ((np.hypot(vel[:, 2], vel[:, 3]) > 0.03 * aw)
-              | (np.abs(vel[:, 0]) > math.radians(0.8))
-              | (np.abs(vel[:, 1]) > 0.02))
-    for s, e, v in runs(moving):  # ignore tiny blips
+    # 1) intentional moves (pans/tilts) vs. held shots, from angular speed
+    sm = qnorm(gsmooth(Q, 0.5 * fps))
+    dots = np.clip(np.abs(np.sum(sm[1:] * sm[:-1], axis=1)), 0, 1)
+    speed = np.append(2 * np.arccos(dots) * fps, 0.0)
+    moving = speed > math.radians(2.0)
+    for s, e, v in runs(moving):
         if v and e - s < 0.3 * fps:
             moving[s:e] = False
-    for s, e, v in runs(moving):  # very short holds just follow the move
+    for s, e, v in runs(moving):
         if not v and e - s < 1.5 * fps:
             moving[s:e] = True
 
-    # 2) target camera path
-    target = gsmooth(path, sigma_s * fps)
+    # 2) target orientation: hold one average orientation during held shots,
+    #    follow a smoothed path during deliberate moves
+    target = qnorm(gsmooth(Q, sigma_s * fps))
     for s, e, v in runs(moving):
         if v:
             continue
-        seg = path[s:e]
-        t = np.arange(e - s)
-        cands = [np.repeat(seg.mean(0, keepdims=True), e - s, axis=0)]   # fixed average framing
-        coef = np.polyfit(t, seg, 1)                                     # slow steady drift
-        cands.append(np.outer(t, coef[0]) + coef[1])
-        cands.append(gsmooth(seg, 3.0 * fps))                            # very slow wander
+        seg, t = Q[s:e], np.arange(e - s)
+        coef = np.polyfit(t, seg, 1)
+        cands = [np.repeat(seg.mean(0, keepdims=True), e - s, axis=0),   # fixed framing
+                 np.outer(t, coef[0]) + coef[1],                         # slow steady drift
+                 gsmooth(seg, 3.0 * fps)]                                # very slow wander
         for c in cands:
-            if all(fits(corr_params(c[j], s + j)) for j in range(0, e - s, 2)):
+            c = qnorm(c)
+            if all(fits(corr(c[j], s + j)) for j in range(0, e - s, 2)):
                 target[s:e] = c
                 break
         else:
-            target[s:e] = cands[-1]
-    target = gsmooth(target, 0.3 * fps)  # soften transitions between holds and moves
+            target[s:e] = qnorm(cands[-1])
+    target = qnorm(gsmooth(target, 0.3 * fps))
 
-    # 3) never show borders: shrink correction where it exceeds the fixed crop, smoothly
-    wps = [corr_params(target[i], i) for i in range(n)]
+    # 3) never show borders: ease the correction where it exceeds the fixed crop
+    cs = [corr(target[i], i) for i in range(n)]
     k_req = np.ones(n)
-    for i, wp in enumerate(wps):
-        if not fits(wp):
+    for i, c in enumerate(cs):
+        if not fits(c):
             lo, hi = 0.0, 1.0
             for _ in range(14):
                 mid = (lo + hi) / 2
-                lo, hi = (mid, hi) if fits(wp * mid) else (lo, mid)
+                lo, hi = (mid, hi) if fits(c * mid) else (lo, mid)
             k_req[i] = lo
     r = max(1, int(0.5 * fps))
     padded = np.pad(k_req, r, mode="edge")
     k_min = np.min(np.stack([padded[j:j + n] for j in range(2 * r + 1)]), axis=0)
     k = np.minimum(gsmooth(k_min, 0.25 * fps), k_req)
-    return [Z @ to_mat(wps[i] * k[i]) for i in range(n)], float((k < 0.999).mean())
+    mats = [Z @ K @ rv2R(cs[i] * k[i]) @ Kinv for i in range(n)]
+    return mats, float((k < 0.999).mean())
 
 
-# ---------------------------------------------------------------- pass 2
 def render(ffmpeg, src, tmp_out, info, W, H, mats, scale, encoder, progress, cancel):
     crop = f"crop={W}:{H}:0:0" if (W, H) != (info["w"], info["h"]) else None
     dec = Decoder(ffmpeg, src, info["fps_str"], W, H, "bgr24", vf=crop)
@@ -336,7 +429,8 @@ def render(ffmpeg, src, tmp_out, info, W, H, mats, scale, encoder, progress, can
     cmd += ["-movflags", "+faststart", "-map_metadata", "1", "-f", "mp4", tmp_out]
     enc_err = tempfile.TemporaryFile()
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_err)
-    cf = np.array([W / 2.0, H / 2.0])
+    S = np.diag([W / scale[0], H / scale[1], 1.0])  # analysis px -> full-res px
+    Sinv = np.linalg.inv(S)
     total = len(mats)
     i = 0
     try:
@@ -346,12 +440,9 @@ def render(ffmpeg, src, tmp_out, info, W, H, mats, scale, encoder, progress, can
             f = dec.read()
             if f is None:
                 break
-            m = mats[min(i, total - 1)].copy()
-            m[:2, 2] *= scale
-            lin = m[:2, :2]
-            M = np.hstack([lin, (m[:2, 2] + cf - lin @ cf)[:, None]])
-            out = cv2.warpAffine(f, M, (W, H), flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_REPLICATE)
+            M = S @ mats[min(i, total - 1)] @ Sinv
+            out = cv2.warpPerspective(f, M, (W, H), flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REPLICATE)
             try:
                 enc.stdin.write(out.tobytes())
             except BrokenPipeError:
@@ -374,16 +465,17 @@ def render(ffmpeg, src, tmp_out, info, W, H, mats, scale, encoder, progress, can
 
 
 # ---------------------------------------------------------------- main entry
+
+# ---------------------------------------------------------------- outputs & motion cache
 def output_path(src):
     return os.path.splitext(src)[0] + "_stabilized.mp4"
 
 
-# ---------------------------------------------------------------- motion cache
-MOTION_VERSION = 1
+MOTION_VERSION = 2
 
 
 def motion_path(src):
-    """Saved camera-motion analysis, next to the original (e.g. IMG_4569_motion.npz)."""
+    """Saved camera-rotation analysis, next to the original (e.g. IMG_4569_motion.npz)."""
     return os.path.splitext(src)[0] + "_motion.npz"
 
 
@@ -392,25 +484,42 @@ def _src_id(src):
     return np.array([st.st_size, int(st.st_mtime)], np.int64)
 
 
-def load_motion(src, info, aw, ah):
-    """Return the saved camera path if it matches this exact file and settings, else None."""
+def _region_arr(region):
+    return np.array(region if region is not None else [-1, -1, -1, -1], float)
+
+
+def saved_region(src):
+    """Reference area stored with a previous analysis of this video (or None)."""
+    try:
+        d = np.load(motion_path(src))
+        r = d["region"]
+        return tuple(float(x) for x in r) if int(d["version"]) == MOTION_VERSION and r[0] >= 0 \
+            else None
+    except Exception:
+        return None
+
+
+def load_motion(src, info, aw, ah, region):
     try:
         d = np.load(motion_path(src))
         if (int(d["version"]) == MOTION_VERSION and np.array_equal(d["src_id"], _src_id(src))
                 and int(d["aw"]) == aw and int(d["ah"]) == ah
-                and str(d["fps_str"]) == info["fps_str"]):
-            return d["path"]
+                and str(d["fps_str"]) == info["fps_str"]
+                and np.allclose(d["region"], _region_arr(region))):
+            return d["rotvecs"], d["K"]
     except Exception:
         pass
     return None
 
 
-def save_motion(src, info, aw, ah, path):
-    """Saves per-frame camera path: columns = angle (rad), log scale, x, y (analysis px,
-    centered coords, frame 0 -> frame t). Any strength can be re-planned from this."""
+def save_motion(src, info, aw, ah, region, rotvecs, K):
+    """rotvecs: per-frame camera orientation (Rodrigues vector, radians; x=pitch axis,
+    y=yaw axis, z=roll axis) relative to frame 0. K: lens matrix in analysis pixels.
+    Any strength can be re-planned from this without re-analyzing."""
     try:
         np.savez(motion_path(src), version=MOTION_VERSION, src_id=_src_id(src), aw=aw, ah=ah,
-                 fps_str=info["fps_str"], fps=info["fps"], path=path)
+                 fps_str=info["fps_str"], fps=info["fps"], region=_region_arr(region),
+                 rotvecs=rotvecs, K=K)
     except OSError:
         pass  # read-only folder: just analyze again next time
 
@@ -423,7 +532,9 @@ def check_dependencies():
     return ff, fp
 
 
-def stabilize(src, dst, strength="Gentle", progress=lambda f, m: None, cancel=None):
+def stabilize(src, dst, strength="Gentle", progress=lambda f, m: None, cancel=None,
+              region=None):
+    """region: reference area (x0, y0, x1, y1) as fractions of the first frame, or None."""
     import threading
     cancel = cancel or threading.Event()
     ffmpeg, ffprobe = check_dependencies()
@@ -435,26 +546,28 @@ def stabilize(src, dst, strength="Gentle", progress=lambda f, m: None, cancel=No
 
     progress(0.0, "Checking encoder…")
     encoder = pick_encoder(ffmpeg)
-    path = load_motion(src, info, aw, ah)
-    if path is None:
-        path = analyze(ffmpeg, src, info, aw, ah, progress, cancel)
-        save_motion(src, info, aw, ah, path)
+    cached = load_motion(src, info, aw, ah, region)
+    if cached is None:
+        K = camera_matrix(aw, ah, info["f35"])
+        rotvecs = analyze(ffmpeg, src, info, aw, ah, K, region, progress, cancel)
+        save_motion(src, info, aw, ah, region, rotvecs, K)
     else:
+        rotvecs, K = cached
         progress(0.4, "Using saved motion analysis…")
-    progress(0.4, "Planning smooth camera path…")
-    mats, limited = plan(path, info["fps"], aw, ah, cfg["zoom"], cfg["sigma"])
+    progress(0.4, "Planning smooth camera orientation…")
+    mats, limited = plan(rotvecs, info["fps"], K, aw, ah, cfg["zoom"], cfg["sigma"])
 
     d, b = os.path.split(dst)
     tmp = os.path.join(d, "." + b + ".partial.mp4")
     try:
         try:
-            kept, skipped = render(ffmpeg, src, tmp, info, W, H, mats, W / aw, encoder,
+            kept, skipped = render(ffmpeg, src, tmp, info, W, H, mats, (aw, ah), encoder,
                                    progress, cancel)
         except StabilizeError:
             if encoder != "libx264":
                 progress(0.4, "Hardware encoder failed; retrying with software encoder…")
                 encoder = "libx264"
-                kept, skipped = render(ffmpeg, src, tmp, info, W, H, mats, W / aw, encoder,
+                kept, skipped = render(ffmpeg, src, tmp, info, W, H, mats, (aw, ah), encoder,
                                        progress, cancel)
             else:
                 raise
